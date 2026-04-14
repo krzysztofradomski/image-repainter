@@ -41,13 +41,14 @@ function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [currentRal, setCurrentRal] = useState(STARTER_RAL);
   const [models, setModels] = useState<Model[]>([]);
-  const [selectedModel, setSelectedModel] = useState("gemini-1.5-flash");
+  const [selectedModel, setSelectedModel] = useState("gemini-2.5-flash");
   const [isFetchingModels, setIsFetchingModels] = useState(false);
   const [status, setStatus] = useState<{
     type: "success" | "error";
     message: string;
     onRetry?: () => void;
   } | null>(null);
+  const [maskPoints, setMaskPoints] = useState<[number, number][]>([]);
 
   const showStatus = (
     message: string,
@@ -77,13 +78,13 @@ function App() {
             m.supportedGenerationMethods.includes("generateContent"),
           );
           setModels(filteredModels);
-          // If gemini-1.5-flash is not in the list, pick the first one
+          // If gemini-2.5-flash is not in the list, pick the first one
           if (
-            !filteredModels.some((m) => m.name === "models/gemini-1.5-flash")
+            !filteredModels.some((m) => m.name === "models/gemini-2.5-flash")
           ) {
             setSelectedModel(
               filteredModels[0]?.name.replace("models/", "") ||
-                "gemini-1.5-flash",
+                "gemini-2.5-flash",
             );
           }
         }
@@ -109,23 +110,48 @@ function App() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(base, 0, 0);
 
-    // Pass 1: Set the hue and saturation
-    ctx.globalCompositeOperation = "color";
-    ctx.fillStyle = hex;
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    if (maskPoints.length > 0) {
+      ctx.save();
+      // Create clipping path from mask
+      ctx.beginPath();
+      maskPoints.forEach(([y, x], index) => {
+        const px = (x / 1000) * canvas.width;
+        const py = (y / 1000) * canvas.height;
+        if (index === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      });
+      ctx.closePath();
+      ctx.clip();
 
-    // Pass 2: Tilt the luminosity towards the target color
-    // This allows black objects to become white and vice versa while preserving texture
-    ctx.globalCompositeOperation = "overlay";
-    ctx.fillStyle = hex;
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+      // Pass 1: Multiply - Best for white furniture as it preserves shadows but tints the white
+      ctx.globalCompositeOperation = "multiply";
+      ctx.fillStyle = hex;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
 
+      // Pass 2: Overlay - Adds vividness and brings back highlights
+      ctx.globalAlpha = 0.4;
+      ctx.globalCompositeOperation = "overlay";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      // Pass 3: Color - Finalizes the hue consistency
+      ctx.globalAlpha = 0.3;
+      ctx.globalCompositeOperation = "color";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      ctx.restore();
+    } else {
+      // Fallback if no mask: simple color mode
+      ctx.globalCompositeOperation = "color";
+      ctx.fillStyle = hex;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+
+    ctx.globalAlpha = 1.0;
     ctx.globalCompositeOperation = "source-over";
   };
 
   const initCanvas = (imageUrl: string) => {
     const img = new Image();
-    // CRITICAL: This allows us to manipulate images from external domains
     img.crossOrigin = "anonymous";
     img.src = imageUrl;
     img.onload = () => {
@@ -134,9 +160,8 @@ function App() {
       baseCanvas.height = img.height;
       const bCtx = baseCanvas.getContext("2d");
       if (bCtx) {
-        // We use a more aggressive filter to ensure black objects have enough brightness
-        // to be recolored, while keeping contrast for texture details.
-        bCtx.filter = "grayscale(100%) contrast(150%) brightness(130%)";
+        // Less aggressive filter to preserve natural lighting for multiply blending
+        bCtx.filter = "grayscale(100%) brightness(105%) contrast(110%)";
         bCtx.drawImage(img, 0, 0);
         colorlessBaseRef.current = baseCanvas;
       }
@@ -163,17 +188,50 @@ function App() {
     modelOverride?: string,
   ) => {
     setIsProcessing(true);
+    setMaskPoints([]); // Clear old mask
     try {
       const genAI = new GoogleGenerativeAI(API_KEY);
       const model = genAI.getGenerativeModel(
         { model: modelOverride || selectedModel },
         { apiVersion: "v1" },
       );
-      await model.generateContent([
-        "Analyze this object for RAL color application. Confirm surface texture.",
+
+      const prompt = `
+        Identify the main piece of furniture in this image.
+        Return a JSON object with:
+        1. "texture": describe the surface (e.g. "matte wood", "glossy metal").
+        2. "polygon": a list of [y, x] coordinates (normalized 0-1000) that form a detailed mask around the furniture.
+        
+        Return ONLY valid JSON.
+      `;
+
+      const result = await model.generateContent([
+        prompt,
         { inlineData: { data: base64Data, mimeType: "image/png" } },
       ]);
-      showStatus("Image analyzed! Surface texture identified.", "success");
+
+      const response = result.response;
+      const text = response.text();
+
+      // Extract JSON from response (handling potential markdown blocks)
+      const jsonStr = text.substring(
+        text.indexOf("{"),
+        text.lastIndexOf("}") + 1,
+      );
+      const data = JSON.parse(jsonStr);
+
+      if (data.polygon && Array.isArray(data.polygon)) {
+        setMaskPoints(data.polygon);
+        showStatus(
+          `Object identified: ${data.texture || "Furniture"}. Masking active.`,
+          "success",
+        );
+      } else {
+        showStatus(
+          "Could not generate precision mask. Using fallback.",
+          "error",
+        );
+      }
     } catch (err) {
       showStatus("Gemini Error: " + (err.message || err), "error", () =>
         triggerGeminiAnalysis(base64Data, modelOverride),
@@ -291,8 +349,8 @@ function App() {
                     </option>
                   ))
                 ) : (
-                  <option value="gemini-1.5-flash">
-                    Gemini 1.5 Flash (Default)
+                  <option value="gemini-2.5-flash">
+                    Gemini 2.5 Flash (Default)
                   </option>
                 )}
               </select>
@@ -441,11 +499,18 @@ function App() {
           )}
 
           {image && (
-            <div className="p-12 w-full h-full flex items-center justify-center">
-              <canvas
-                ref={canvasRef}
-                className="max-w-full max-h-full drop-shadow-2xl"
-              />
+            <div className="p-12 w-full h-full flex flex-col items-center justify-center">
+              <div className="relative group">
+                <canvas
+                  ref={canvasRef}
+                  className="max-w-full max-h-[70vh] drop-shadow-2xl"
+                />
+                {maskPoints.length > 0 && (
+                  <div className="absolute top-4 left-4 bg-emerald-500/80 backdrop-blur-sm text-white px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider flex items-center gap-2">
+                    <CheckCircle size={12} /> AI Mask Active
+                  </div>
+                )}
+              </div>
             </div>
           )}
         </div>
